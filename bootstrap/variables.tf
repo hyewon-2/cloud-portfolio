@@ -23,3 +23,15 @@ variable "budget_limit_usd" {
   type        = number
   default     = 5
 }
+
+variable "aws_profile" {
+  description = "사용할 AWS CLI 프로필"
+  type        = string
+  default     = "personal"
+}
+
+variable "aws_account_id" {
+  description = "이 계정이 아니면 Terraform이 실행을 거부한다"
+  type        = string
+  default     = "458255180711"
+}
