@@ -12,7 +12,7 @@ APP_VERSION = os.environ.get("APP_VERSION", "local")
 @app.get("/")
 def index():
     return jsonify(
-        message="Hello from cloud-portfolio",
+        message="Deployed automatically by GitHub Actions!",
         version=APP_VERSION,
         # ECS에서 태스크가 여러 개일 때 어느 컨테이너가 응답했는지 보여 준다.
         host=socket.gethostname(),
