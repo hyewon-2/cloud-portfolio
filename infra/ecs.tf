@@ -92,4 +92,9 @@ resource "aws_ecs_service" "app" {
 
   # 리스너가 먼저 있어야 서비스가 대상 그룹에 태스크를 등록할 수 있다.
   depends_on = [aws_lb_listener.http]
+
+  # 배포 후 태스크 정의 버전은 GitHub Actions가 바꾼다. Terraform이 옛 버전으로 되돌리지 않게 무시한다.
+  lifecycle {
+    ignore_changes = [task_definition]
+  }
 }

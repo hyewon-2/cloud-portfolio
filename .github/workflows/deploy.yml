@@ -1,0 +1,105 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 같은 브랜치에서 배포가 겹치지 않도록 이전 실행이 끝날 때까지 기다린다.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-northeast-2
+  # 비밀 정보가 아니다. 이 역할은 hyewon-2/cloud-portfolio main 브랜치에서만 쓸 수 있다 (bootstrap/main.tf).
+  AWS_ROLE_ARN: arn:aws:iam::458255180711:role/cloud-portfolio-github-actions
+  ECR_REPOSITORY: cloud-portfolio
+  ECS_CLUSTER: cloud-portfolio
+  ECS_SERVICE: cloud-portfolio
+  CONTAINER_NAME: app
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -q
+
+  deploy:
+    # PR에서는 테스트만 돌리고, main에 push됐을 때만 배포한다.
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC 토큰을 받기 위해 필요하다.
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      # 저장된 액세스 키 없이, GitHub OIDC 토큰으로 임시 자격증명을 받는다.
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - id: image
+        name: Build and push image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          TAG="${GITHUB_SHA::7}"
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:$TAG"
+          # provenance/sbom을 끄면 ECR에 이미지가 하나만 올라간다 (infra/ecs.tf의 most_recent 조회가 헷갈리지 않게).
+          docker build --provenance=false --sbom=false --build-arg APP_VERSION="$TAG" -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "uri=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      # 비용을 아끼려고 infra/를 작업할 때만 켠다. 꺼져 있으면 이미지만 올리고 배포는 건너뛴다.
+      # 다음에 terraform apply 하면 ECR의 최신 이미지로 뜬다.
+      - id: service
+        name: Check if ECS service is running
+        run: |
+          COUNT=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'length(services[?status==`ACTIVE`])' --output text 2>/dev/null || echo 0)
+          if [ "$COUNT" = "1" ]; then
+            echo "active=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "active=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::ECS service is not running (infra destroyed). Image pushed, deploy skipped."
+          fi
+
+      - name: Download current task definition
+        if: steps.service.outputs.active == 'true'
+        run: |
+          aws ecs describe-task-definition --task-definition "$ECS_SERVICE" \
+            --query taskDefinition > task-definition.json
+
+      # 현재 태스크 정의에서 이미지 주소만 새 이미지로 바꾼다.
+      - id: render
+        if: steps.service.outputs.active == 'true'
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.image.outputs.uri }}
+
+      # 새 태스크 정의를 등록하고 서비스를 업데이트한 뒤, 새 태스크가 정상이 될 때까지 기다린다.
+      - if: steps.service.outputs.active == 'true'
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
